@@ -12,6 +12,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
 from aegis_mem.core.engine import AegisMemoryEngine, set_engine
+from aegis_mem.core.reflector import clear_dedup_cache
 
 
 def _deterministic_embed(text: str, dim: int = 32) -> list[float]:
@@ -147,9 +148,10 @@ class InMemoryQdrantMem0Adapter:
 @pytest.fixture()
 def in_memory_engine() -> AegisMemoryEngine:
     """Provide an `AegisMemoryEngine` wired to an in-memory Qdrant instance (`:memory:`)."""
+    clear_dedup_cache()
     adapter = InMemoryQdrantMem0Adapter()
     engine = AegisMemoryEngine(memory_client=adapter)
     set_engine(engine)
     yield engine
+    clear_dedup_cache()
     set_engine(None)
-

@@ -1,4 +1,4 @@
-"""Tests for `reflector.py`, `@auto_learn` decorator, FastMCP tools, and FastAPI endpoints."""
+"""Tests for `reflector.py`, SHA-256 circuit breaker, `@auto_learn` decorator, FastMCP tools, and FastAPI endpoints."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from aegis_mem.interfaces.mcp_server import (
     commit_learned_fact,
     get_procedural_memories,
     record_execution_failure,
+    report_rule_outcome,
 )
 from aegis_mem.utils.decorators import auto_learn
 
@@ -58,6 +59,7 @@ async def test_distill_failure_stores_recoverable_procedural_rule(
     )
 
     assert reflection.stored is True
+    assert reflection.deduplicated is False
     assert len(reflection.distilled_rule) <= 200
     assert "\n" not in reflection.distilled_rule
     assert "secret_jwt_token_123456789" not in reflection.sanitized_error
@@ -71,6 +73,48 @@ async def test_distill_failure_stores_recoverable_procedural_rule(
     )
     assert len(recalled) == 1
     assert "ISO-8601" in recalled[0].rule or "422" in recalled[0].rule
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_blocks_duplicate_error_burst(
+    in_memory_engine: AegisMemoryEngine,
+) -> None:
+    """Verify 10 identical exceptions (with volatile request IDs/timestamps) trigger only 1 LLM distillation."""
+    llm_call_count = 0
+
+    def tracked_llm(sanitized_err: str, sanitized_ctx: str) -> str:
+        nonlocal llm_call_count
+        llm_call_count += 1
+        return "Route /v1/orders to standby gateway when HTTP 502 Bad Gateway occurs."
+
+    results = []
+    for i in range(10):
+        # Volatile request IDs and timestamps change each iteration, but normalized fingerprint is identical
+        trace = (
+            f"HTTPStatusError: HTTP 502 Bad Gateway on POST /v1/orders "
+            f"[req_id=550e8400-e29b-41d4-a716-44665544000{i} ts=2026-11-11T00:10:{10 + i:02d}Z retry={100 + i}]"
+        )
+        res = await distill_failure(
+            error_trace=trace,
+            input_context="POST /v1/orders",
+            agent_id="burst-agent",
+            tool_name="submit_order",
+            engine=in_memory_engine,
+            llm_callable=tracked_llm,
+            cooldown_seconds=300.0,
+        )
+        results.append(res)
+
+    assert llm_call_count == 1
+    assert results[0].stored is True
+    assert results[0].deduplicated is False
+    assert all(r.deduplicated is True and r.stored is False for r in results[1:])
+
+    recalled = await in_memory_engine.recall_rules(
+        agent_id="burst-agent",
+        task_query="POST /v1/orders gateway error",
+    )
+    assert len(recalled) == 1
 
 
 @pytest.mark.asyncio
@@ -107,6 +151,7 @@ async def test_mcp_tools_and_fastapi_endpoints(
     mcp_fn_record = getattr(record_execution_failure, "fn", record_execution_failure)
     mcp_fn_recall = getattr(get_procedural_memories, "fn", get_procedural_memories)
     mcp_fn_commit = getattr(commit_learned_fact, "fn", commit_learned_fact)
+    mcp_fn_outcome = getattr(report_rule_outcome, "fn", report_rule_outcome)
 
     rec_res = await mcp_fn_record(
         agent_id="mcp-agent",
@@ -130,6 +175,15 @@ async def test_mcp_tools_and_fastapi_endpoints(
     )
     assert recall_res["success"] is True
     assert recall_res["data"]["count"] == 2
+
+    first_mem_id = recall_res["data"]["rules"][0]["memory_id"]
+    outcome_res = await mcp_fn_outcome(
+        agent_id="mcp-agent",
+        memory_id=first_mem_id,
+        succeeded=True,
+    )
+    assert outcome_res["success"] is True
+    assert outcome_res["data"]["utility_score"] == pytest.approx(1.1)
 
     # FastAPI endpoints test
     client = TestClient(app)
@@ -160,3 +214,14 @@ async def test_mcp_tools_and_fastapi_endpoints(
     assert recall_api_resp.status_code == 200
     assert recall_api_resp.json()["data"]["count"] == 1
 
+    cloud_mem_id = recall_api_resp.json()["data"]["rules"][0]["memory_id"]
+    feedback_resp = client.post(
+        "/v1/memories/feedback",
+        json={
+            "agent_id": "cloud-agent",
+            "memory_id": cloud_mem_id,
+            "succeeded": True,
+        },
+    )
+    assert feedback_resp.status_code == 200
+    assert feedback_resp.json()["data"]["utility_score"] == pytest.approx(1.1)

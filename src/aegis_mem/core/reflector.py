@@ -1,17 +1,18 @@
 """Cognitive Distillation Engine (`reflector.py`).
 
-Sanitizes sensitive credentials/PII from stacktraces and payloads, synthesizes a
-single-line deterministic procedural rule (<= 200 chars), and commits it to `AegisMemoryEngine`.
+Sanitizes sensitive credentials/PII from stacktraces and payloads, enforces a pre-LLM
+SHA-256 deduplication circuit breaker with TTL cooldown, synthesizes a single-line
+deterministic procedural rule (<= 200 chars), and commits it to `AegisMemoryEngine`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import time
 from typing import Any, Callable
 
-from aegis_mem.config import settings
 from aegis_mem.core.engine import AegisMemoryEngine, get_engine
 from aegis_mem.core.telemetry import telemetry
 from aegis_mem.schemas import FailureReflectionInput, ReflectionResult
@@ -47,6 +48,27 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
 ]
 
+# Normalization patterns for deterministic SHA-256 fingerprinting (UUIDs, ISO dates, hex addresses, volatile numbers)
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_ISO_TS_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+_HEX_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
+# Preserve common HTTP status codes (400-599) while normalizing arbitrary volatile numbers (req_ids, epochs, line numbers)
+_VOLATILE_NUM_RE = re.compile(r"\b(?!4\d{2}\b|5\d{2}\b)\d{2,}\b")
+
+# Pre-LLM SHA-256 Deduplication Circuit Breaker state
+_dedup_cache: dict[str, float] = {}
+_dedup_results: dict[str, ReflectionResult] = {}
+
+
+def clear_dedup_cache() -> None:
+    """Reset the in-memory circuit breaker deduplication cache (used in test suites)."""
+    _dedup_cache.clear()
+    _dedup_results.clear()
+
 
 def sanitize_sensitive_text(raw_text: str) -> str:
     """Sanitize API keys, tokens, passwords, and PII from tracebacks and payloads."""
@@ -54,6 +76,36 @@ def sanitize_sensitive_text(raw_text: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         sanitized = pattern.sub(replacement, sanitized)
     return sanitized
+
+
+def _extract_exception_type(sanitized_error: str) -> str:
+    """Extract the leading or trailing exception/status class from a sanitized traceback."""
+    lines = [ln.strip() for ln in sanitized_error.splitlines() if ln.strip()]
+    if not lines:
+        return "UnknownError"
+    last_line = lines[-1]
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning|Fault|Status))", last_line)
+    if match:
+        return match.group(1)
+    http_match = re.search(r"\bHTTP\s*([45]\d{2})\b", sanitized_error, re.IGNORECASE)
+    if http_match:
+        return f"HTTP_{http_match.group(1)}"
+    first_token = last_line.split(":", 1)[0].strip()
+    if first_token and len(first_token) <= 48 and " " not in first_token:
+        return first_token
+    return "ExecutionError"
+
+
+def compute_error_fingerprint(agent_id: str, sanitized_error: str) -> str:
+    """Compute `sha256(f'{agent_id}:{exception_type}:{normalized_sanitized_error}')`."""
+    exc_type = _extract_exception_type(sanitized_error)
+    normalized = _UUID_RE.sub("<UUID>", sanitized_error)
+    normalized = _ISO_TS_RE.sub("<TS>", normalized)
+    normalized = _HEX_RE.sub("<HEX>", normalized)
+    normalized = _VOLATILE_NUM_RE.sub("<NUM>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    raw_key = f"{agent_id.strip()}:{exc_type}:{normalized}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 def _normalize_single_line_rule(raw_rule: str, max_chars: int = 200) -> str:
@@ -77,6 +129,10 @@ def _heuristic_distill(sanitized_error: str, sanitized_context: str) -> str:
     if "429" in lower_err or "rate limit" in lower_err or "too many requests" in lower_err:
         return _normalize_single_line_rule(
             f"Prevent HTTP 429 rate-limit on ({sanitized_context[:60]}): throttle requests and apply exponential backoff."
+        )
+    if "502" in lower_err or "503" in lower_err or "bad gateway" in lower_err:
+        return _normalize_single_line_rule(
+            f"Mitigate HTTP 502/503 gateway fault on ({sanitized_context[:60]}): switch to fallback replica or circuit-break retries."
         )
     last_line = sanitized_error.strip().splitlines()[-1] if sanitized_error.strip() else "unknown error"
     return _normalize_single_line_rule(
@@ -121,8 +177,9 @@ async def distill_failure(
     metadata: dict[str, Any] | None = None,
     engine: AegisMemoryEngine | None = None,
     llm_callable: Callable[[str, str], str] | None = None,
+    cooldown_seconds: float = 300.0,
 ) -> ReflectionResult:
-    """Sanitize secrets, distill a <=200-char procedural rule, and commit it to `AegisMemoryEngine`."""
+    """Sanitize secrets, check SHA-256 circuit breaker, distill <=200-char rule, and commit to `AegisMemoryEngine`."""
     payload = FailureReflectionInput(
         agent_id=agent_id,
         error_trace=error_trace,
@@ -134,6 +191,40 @@ async def distill_failure(
     start = time.perf_counter()
     sanitized_err = sanitize_sensitive_text(payload.error_trace)
     sanitized_ctx = sanitize_sensitive_text(payload.input_context)
+
+    # Pre-LLM SHA-256 Deduplication Circuit Breaker check
+    fingerprint = compute_error_fingerprint(payload.agent_id, sanitized_err)
+    now_mono = time.monotonic()
+    last_seen = _dedup_cache.get(fingerprint)
+    if (
+        cooldown_seconds > 0
+        and last_seen is not None
+        and (now_mono - last_seen) < cooldown_seconds
+        and fingerprint in _dedup_results
+    ):
+        cached = _dedup_results[fingerprint]
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        await telemetry.log_event(
+            event_type="circuit_breaker_dedup_hit",
+            agent_id=payload.agent_id,
+            latency_ms=elapsed_ms,
+            success=True,
+            details={
+                "fingerprint": fingerprint,
+                "tool_name": payload.tool_name,
+                "llm_tokens_consumed": 0,
+                "cached_memory_id": cached.memory_id,
+            },
+        )
+        return ReflectionResult(
+            agent_id=payload.agent_id,
+            sanitized_error=sanitized_err,
+            distilled_rule=cached.distilled_rule,
+            memory_id=cached.memory_id,
+            stored=False,
+            deduplicated=True,
+            fingerprint=fingerprint,
+        )
 
     active_engine = engine or get_engine()
 
@@ -149,6 +240,7 @@ async def distill_failure(
         "category": "error_remediation",
         "type": "procedural_rule",
         "source": "self_reflection",
+        "fingerprint": fingerprint,
         **payload.metadata,
     }
     if payload.tool_name:
@@ -179,14 +271,19 @@ async def distill_failure(
             "tool_name": payload.tool_name,
             "distilled_rule": distilled_rule,
             "memory_id": memory_id,
+            "fingerprint": fingerprint,
         },
     )
 
-    return ReflectionResult(
+    result = ReflectionResult(
         agent_id=payload.agent_id,
         sanitized_error=sanitized_err,
         distilled_rule=distilled_rule,
         memory_id=memory_id,
         stored=True,
+        deduplicated=False,
+        fingerprint=fingerprint,
     )
-
+    _dedup_cache[fingerprint] = now_mono
+    _dedup_results[fingerprint] = result
+    return result

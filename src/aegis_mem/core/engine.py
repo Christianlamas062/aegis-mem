@@ -10,7 +10,12 @@ from mem0 import Memory
 
 from aegis_mem.config import settings
 from aegis_mem.core.telemetry import telemetry
-from aegis_mem.schemas import MemoryCreate, MemorySearchQuery, ProceduralRuleOutput
+from aegis_mem.schemas import (
+    MemoryCreate,
+    MemorySearchQuery,
+    ProceduralRuleOutput,
+    RuleOutcomeResult,
+)
 
 
 class AegisMemoryEngine:
@@ -188,6 +193,63 @@ class AegisMemoryEngine:
         )
         return {"deleted": True, "memory_id": cleaned_id}
 
+    async def record_rule_outcome(
+        self,
+        memory_id: str,
+        agent_id: str,
+        succeeded: bool,
+        prune_threshold: float = 0.3,
+    ) -> RuleOutcomeResult:
+        """Update adaptive utility score (+0.1 on success capped at 2.0; -0.4 on failure) and auto-prune if < threshold."""
+        scope_id = self._enforce_scope(agent_id)
+        cleaned_mem_id = memory_id.strip()
+        if not cleaned_mem_id:
+            raise ValueError("memory_id cannot be empty")
+
+        start = time.perf_counter()
+        updated_score = await telemetry.update_rule_outcome(
+            memory_id=cleaned_mem_id,
+            agent_id=scope_id,
+            succeeded=succeeded,
+        )
+        pruned = False
+        if updated_score < prune_threshold:
+            await self.prune_obsolete(memory_id=cleaned_mem_id, agent_id=scope_id)
+            pruned = True
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            await telemetry.log_event(
+                event_type="stale_rule_auto_pruned",
+                agent_id=scope_id,
+                latency_ms=elapsed_ms,
+                success=True,
+                details={
+                    "memory_id": cleaned_mem_id,
+                    "utility_score": updated_score,
+                    "prune_threshold": prune_threshold,
+                },
+            )
+        else:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            await telemetry.log_event(
+                event_type="rule_outcome_recorded",
+                agent_id=scope_id,
+                latency_ms=elapsed_ms,
+                success=True,
+                details={
+                    "memory_id": cleaned_mem_id,
+                    "succeeded": succeeded,
+                    "utility_score": updated_score,
+                },
+            )
+
+        return RuleOutcomeResult(
+            memory_id=cleaned_mem_id,
+            agent_id=scope_id,
+            succeeded=succeeded,
+            utility_score=updated_score,
+            pruned=pruned,
+        )
+
 
 _default_engine: AegisMemoryEngine | None = None
 
@@ -204,4 +266,3 @@ def set_engine(engine: AegisMemoryEngine | None) -> None:
     """Override the active engine instance (used by unit tests and custom DI)."""
     global _default_engine
     _default_engine = engine
-

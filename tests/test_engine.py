@@ -1,4 +1,4 @@
-"""Unit tests for `AegisMemoryEngine` retention, scoping, conflict resolution, and pruning."""
+"""Unit tests for `AegisMemoryEngine` retention, scoping, conflict resolution, pruning, and utility decay."""
 
 from __future__ import annotations
 
@@ -99,3 +99,41 @@ async def test_unbounded_context_is_rejected(in_memory_engine: AegisMemoryEngine
     with pytest.raises(ValidationError):
         MemorySearchQuery(agent_id="   ", task_description="any query")
 
+
+@pytest.mark.asyncio
+async def test_utility_decay_auto_prunes_failing_rule(
+    in_memory_engine: AegisMemoryEngine,
+) -> None:
+    """Verify two consecutive negative outcomes drop score < 0.3 (1.0 -> 0.6 -> 0.2) and purge the vector from Qdrant."""
+    stored = await in_memory_engine.store_rule(
+        agent_id="decay-agent",
+        rule_text="Outdated routing rule: send all /v1/payments requests to legacy-gateway-01.",
+        metadata={"endpoint": "/v1/payments"},
+    )
+    mem_id = stored["results"][0]["id"]
+
+    # First negative outcome: 1.0 - 0.4 = 0.6 (still >= 0.3, not pruned yet)
+    outcome_1 = await in_memory_engine.record_rule_outcome(
+        memory_id=mem_id,
+        agent_id="decay-agent",
+        succeeded=False,
+        prune_threshold=0.3,
+    )
+    assert outcome_1.utility_score == pytest.approx(0.6)
+    assert outcome_1.pruned is False
+
+    still_present = await in_memory_engine.recall_rules("decay-agent", "payments routing")
+    assert len(still_present) == 1
+
+    # Second negative outcome: 0.6 - 0.4 = 0.2 (< 0.3 -> automatically pruned from Qdrant!)
+    outcome_2 = await in_memory_engine.record_rule_outcome(
+        memory_id=mem_id,
+        agent_id="decay-agent",
+        succeeded=False,
+        prune_threshold=0.3,
+    )
+    assert outcome_2.utility_score == pytest.approx(0.2)
+    assert outcome_2.pruned is True
+
+    after_prune = await in_memory_engine.recall_rules("decay-agent", "payments routing")
+    assert len(after_prune) == 0

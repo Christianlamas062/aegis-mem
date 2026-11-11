@@ -1,4 +1,4 @@
-"""FastAPI Cloud API for multi-agent procedural memory recall and non-blocking reflection."""
+"""FastAPI Cloud API for multi-agent procedural memory recall, non-blocking reflection, and utility feedback."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from aegis_mem.schemas import (
     FailureReflectionInput,
     MemoryCreate,
     MemorySearchQuery,
+    RuleFeedbackInput,
     ToolResponse,
 )
 
@@ -124,3 +125,35 @@ async def commit_memory(payload: MemoryCreate) -> ToolResponse | JSONResponse:
             ).model_dump(),
         )
 
+
+@app.post("/v1/memories/feedback", response_model=ToolResponse)
+async def report_memory_feedback(
+    payload: RuleFeedbackInput,
+) -> ToolResponse | JSONResponse:
+    """Update adaptive utility score for a procedural rule and auto-prune if below threshold."""
+    try:
+        outcome = await get_engine().record_rule_outcome(
+            memory_id=payload.memory_id,
+            agent_id=payload.agent_id,
+            succeeded=payload.succeeded,
+            prune_threshold=payload.prune_threshold,
+        )
+        return ToolResponse(
+            success=True,
+            data=outcome.model_dump(),
+        )
+    except Exception as exc:
+        await telemetry.log_event(
+            event_type="api_feedback_error",
+            agent_id=payload.agent_id,
+            success=False,
+            details={"error": str(exc)},
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=ToolResponse(
+                success=False,
+                error_code="FEEDBACK_ENGINE_ERROR",
+                remediation_hint=f"Failed to record rule outcome: {exc}",
+            ).model_dump(),
+        )

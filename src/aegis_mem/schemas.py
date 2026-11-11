@@ -101,7 +101,35 @@ class ReflectionResult(BaseModel):
     distilled_rule: str = Field(..., max_length=200)
     memory_id: str | None = None
     stored: bool = True
+    deduplicated: bool = False
+    fingerprint: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RuleFeedbackInput(ScopedContext):
+    """Contract for reporting whether a recalled procedural rule succeeded or failed in execution."""
+
+    memory_id: str = Field(..., min_length=1, description="Vector ID of the recalled procedural rule")
+    succeeded: bool = Field(
+        ...,
+        description="True if applying the rule resolved/prevented failure; False if execution still failed",
+    )
+    prune_threshold: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=2.0,
+        description="Utility threshold below which the rule is automatically pruned from Qdrant",
+    )
+
+
+class RuleOutcomeResult(BaseModel):
+    """Result returned by `engine.record_rule_outcome`."""
+
+    memory_id: str
+    agent_id: str
+    succeeded: bool
+    utility_score: float
+    pruned: bool = False
 
 
 class ToolResponse(BaseModel):
@@ -117,4 +145,3 @@ class ToolResponse(BaseModel):
     remediation_hint: str | None = Field(
         default=None, description="Actionable instruction for the calling agent on error"
     )
-

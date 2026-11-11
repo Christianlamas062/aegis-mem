@@ -1,4 +1,4 @@
-"""FastMCP server exposing procedural memory recall, failure distillation, and rule persistence.
+"""FastMCP server exposing procedural memory recall, failure distillation, rule persistence, and utility feedback.
 
 Follows strict layer separation: calls `core/engine.py` and `core/reflector.py` exclusively,
 catches all exceptions, logs to `core/telemetry.py`, and returns `ToolResponse`.
@@ -13,7 +13,7 @@ from fastmcp import FastMCP
 from aegis_mem.core.engine import get_engine
 from aegis_mem.core.reflector import distill_failure
 from aegis_mem.core.telemetry import telemetry
-from aegis_mem.schemas import MemoryCreate, MemorySearchQuery, ToolResponse
+from aegis_mem.schemas import MemoryCreate, MemorySearchQuery, RuleFeedbackInput, ToolResponse
 
 mcp = FastMCP("aegis-mem")
 
@@ -168,6 +168,56 @@ async def commit_learned_fact(
         ).model_dump()
 
 
+@mcp.tool()
+async def report_rule_outcome(
+    agent_id: str,
+    memory_id: str,
+    succeeded: bool,
+    prune_threshold: float = 0.3,
+) -> dict[str, Any]:
+    """Adaptive utility feedback: Report whether a recalled procedural rule succeeded or failed.
+
+    Boosts the rule's utility score by +0.1 on success (capped at 2.0) or penalizes by -0.4 on
+    failure. Automatically prunes the rule from Qdrant if its utility score drops below `prune_threshold`.
+
+    Args:
+        agent_id: Unique identifier of the calling agent.
+        memory_id: Vector ID of the recalled procedural rule.
+        succeeded: True if applying the rule succeeded; False if execution still failed.
+        prune_threshold: Score threshold below which the rule is auto-pruned (default 0.3).
+    """
+    try:
+        feedback = RuleFeedbackInput(
+            agent_id=agent_id,
+            memory_id=memory_id,
+            succeeded=succeeded,
+            prune_threshold=prune_threshold,
+        )
+        outcome = await get_engine().record_rule_outcome(
+            memory_id=feedback.memory_id,
+            agent_id=feedback.agent_id,
+            succeeded=feedback.succeeded,
+            prune_threshold=feedback.prune_threshold,
+        )
+        return ToolResponse(
+            success=True,
+            data=outcome.model_dump(),
+        ).model_dump()
+    except Exception as exc:
+        await telemetry.log_event(
+            event_type="mcp_report_rule_outcome_error",
+            agent_id=agent_id or "unscoped",
+            success=False,
+            details={"error": str(exc)},
+        )
+        return ToolResponse(
+            success=False,
+            error_code="RULE_OUTCOME_FAILED",
+            remediation_hint=(
+                f"Ensure agent_id and memory_id are valid non-empty strings. Details: {exc}"
+            ),
+        ).model_dump()
+
+
 if __name__ == "__main__":
     mcp.run()
-
