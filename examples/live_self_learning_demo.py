@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import os
 import sys
 import time
 import uuid
@@ -183,7 +184,9 @@ async def run_demo() -> None:
     set_engine(engine)
 
     raw_epoch = "1794366000"
-    leaked_auth = "Bearer sk-live-998877665544332211"
+    leaked_auth = os.getenv(
+        "AEGIS_DEMO_AUTH_HEADER", f"Bearer session_tok_{uuid.uuid4().hex[:12]}"
+    )
 
     print("=" * 82)
     print(" 🛡️  AEGIS-MEM | AUTONOMOUS SELF-REFLECTION & PROCEDURAL MEMORY DEMO")

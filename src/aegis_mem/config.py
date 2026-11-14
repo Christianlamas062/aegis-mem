@@ -32,7 +32,7 @@ class AegisSettings(BaseSettings):
     # Primary LLM Provider (OpenAI-compatible or local endpoints)
     llm_provider: str = Field(default="openai", description="Mem0 LLM provider identifier")
     llm_model: str = Field(default="gpt-4o-mini", description="Model identifier for distillation")
-    llm_api_key: str = Field(default="sk-test-placeholder", description="API key for LLM provider")
+    llm_api_key: str = Field(default="", description="API key for LLM provider")
     llm_base_url: str | None = Field(
         default=None,
         description="Optional OpenAI-compatible base URL (e.g. Ollama, vLLM, OpenRouter)",

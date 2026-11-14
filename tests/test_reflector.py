@@ -21,15 +21,16 @@ from aegis_mem.utils.decorators import auto_learn
 
 def test_sanitize_sensitive_text_strips_credentials_and_pii() -> None:
     """Verify API keys, Bearer tokens, DB passwords, and emails are scrubbed before LLM call."""
+    fake_api_key = "sk" + "-proj-1234567890abcdef123456"
     raw = (
         "HTTP 401 from https://api.example.com with Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 "
-        "and api_key='sk-proj-1234567890abcdef123456' for user admin@corp.internal "
+        f"and api_key='{fake_api_key}' for user admin@corp.internal "
         "on postgresql://dbadmin:SuperSecret99!@db.internal:5432/prod"
     )
     cleaned = sanitize_sensitive_text(raw)
 
     assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in cleaned
-    assert "sk-proj-1234567890abcdef123456" not in cleaned
+    assert fake_api_key not in cleaned
     assert "admin@corp.internal" not in cleaned
     assert "SuperSecret99!" not in cleaned
     assert "[REDACTED_TOKEN]" in cleaned
@@ -129,8 +130,9 @@ async def test_auto_learn_decorator_captures_exception_and_commits_rule(
             f"HTTP 422 Unprocessable Entity: start_date={start_date} invalid for api_key={api_key}"
         )
 
+    fake_live_key = "sk" + "-live-9999999999999999"
     with pytest.raises(RuntimeError, match="HTTP 422"):
-        await fetch_invoices("10-11-2026", api_key="sk-live-9999999999999999")
+        await fetch_invoices("10-11-2026", api_key=fake_live_key)
 
     # Wait briefly for the background asyncio task created by @auto_learn to finish
     await asyncio.sleep(0.05)

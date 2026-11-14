@@ -1,4 +1,5 @@
 # 🛡️ aegis-mem: Self-Evolving Procedural Agent Memory
+[![M8ven Score](https://m8ven.ai/badge/mcp/christianlamas062-aegis-mem-ah76iy)](https://m8ven.ai/mcp/christianlamas062-aegis-mem-ah76iy?s=readme)
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![FastMCP](https://img.shields.io/badge/MCP-FastMCP-emerald.svg)](https://github.com/jlowin/fastmcp)
@@ -21,7 +22,7 @@ sequenceDiagram
     participant Audit as SQLite Telemetry (telemetry.py)
 
     Note over Agent,API: Step 1 — Attempt 1 (Execution & Trap)
-    Agent->>API: submit_exchange_order(timestamp="1794366000", auth="Bearer sk-live-...")
+    Agent->>API: submit_exchange_order(timestamp="1794366000", auth="Bearer <SESSION_TOKEN>")
     API-->>Agent: HTTP 422 Unprocessable Entity (Requires ISO-8601 UTC 'Z')
     Agent--)Reflector: asyncio.create_task(distill_failure(traceback, context))
 
@@ -112,7 +113,7 @@ Add the following entry to your `claude_desktop_config.json` or IDE MCP settings
         "AEGIS_COLLECTION_NAME": "aegis_procedural_rules",
         "AEGIS_LLM_PROVIDER": "openai",
         "AEGIS_LLM_MODEL": "gpt-4o-mini",
-        "AEGIS_LLM_API_KEY": "sk-your-api-key"
+        "AEGIS_LLM_API_KEY": "YOUR_OPENAI_API_KEY"
       }
     }
   }
@@ -128,7 +129,7 @@ Or using `uv`:
       "command": "uv",
       "args": [
         "--directory",
-        "C:/Users/Usuario/Desktop/proyectos/aegis-mem",
+        "/absolute/path/to/aegis-mem",
         "run",
         "python",
         "-m",
